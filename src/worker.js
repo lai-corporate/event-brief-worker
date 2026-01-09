@@ -1,24 +1,19 @@
 // ✅ Deploy-safe pdf.js loader (lazy import)
 // IMPORTANT: do NOT define globalThis.window in Workers.
-// It can force pdfjs into "browser" mode and crash.
 let _pdfjsPromise = null;
 
 async function getPdfjs() {
   if (_pdfjsPromise) return _pdfjsPromise;
 
   _pdfjsPromise = (async () => {
-    // Workers already have fetch/URL/ReadableStream; don't fake DOM globals.
-    // Prefer non-legacy build first.
-    try {
-      return await import("pdfjs-dist/build/pdf.mjs");
-    } catch (e1) {
-      // Fallback to legacy if needed
-      return await import("pdfjs-dist/legacy/build/pdf.mjs");
-    }
+    const mod = await import("pdfjs-dist/build/pdf.mjs");
+    // Normalize in case bundler wraps exports
+    return mod?.default ?? mod;
   })();
 
   return _pdfjsPromise;
 }
+
 
 
 export default {
