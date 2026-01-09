@@ -1,4 +1,19 @@
-import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
+// ✅ Deploy-safe pdf.js loader (lazy import)
+// - avoids Cloudflare deploy-time module evaluation crash
+// - caches the import so only loads once per isolate
+let _pdfjsPromise = null;
+
+async function getPdfjs() {
+  if (_pdfjsPromise) return _pdfjsPromise;
+
+  // Minimal polyfills pdfjs sometimes expects
+  globalThis.window ??= globalThis;
+  globalThis.navigator ??= { userAgent: "CloudflareWorkers" };
+  globalThis.location ??= new URL("https://example.com/");
+
+  _pdfjsPromise = import("pdfjs-dist/legacy/build/pdf.mjs");
+  return _pdfjsPromise;
+}
 
 export default {
   async fetch(request) {
@@ -14,8 +29,19 @@ export default {
       const buf = await request.arrayBuffer();
       if (!buf || buf.byteLength < 10) return json({ ok: false, error: "empty_body" }, 400);
 
+      // ✅ Lazy-load pdfjs here
+      const pdfjsLib = await getPdfjs();
+
+      // ✅ Important: disableWorker in Workers runtime
+      const loadingTask = pdfjsLib.getDocument({
+        data: new Uint8Array(buf),
+        disableWorker: true
+      });
+
+      const pdf = await loadingTask.promise;
+
       // 1) Extract text from ALL pages
-      const { rawText, pages } = await extractAllPagesText(buf);
+      const { rawText, pages } = await extractAllPagesText(pdf);
 
       // 2) Best-effort parse
       const parsed = parseLaiEventBrief(rawText);
@@ -27,9 +53,8 @@ export default {
   }
 };
 
-async function extractAllPagesText(arrayBuffer) {
-  const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(arrayBuffer) }).promise;
-
+// Updated: accept already-loaded pdf instance (avoids re-loading)
+async function extractAllPagesText(pdf) {
   const pages = [];
   for (let p = 1; p <= pdf.numPages; p++) {
     const page = await pdf.getPage(p);
@@ -37,7 +62,6 @@ async function extractAllPagesText(arrayBuffer) {
     const text = content.items.map(i => i.str).join(" ");
     pages.push({ page: p, text });
   }
-
   const rawText = pages.map(x => `\n\n=== PAGE ${x.page} ===\n${x.text}`).join("");
   return { rawText, pages };
 }
@@ -178,3 +202,4 @@ function json(obj, status = 200) {
     headers: { "content-type": "application/json; charset=utf-8" }
   });
 }
+
