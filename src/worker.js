@@ -1,20 +1,28 @@
-// ✅ Deploy-safe pdf.js loader (lazy import)
-// IMPORTANT: do NOT define globalThis.window in Workers.
+// ✅ Deploy-safe pdf.js loader (lazy import) for Cloudflare Workers
 let _pdfjsPromise = null;
 
 async function getPdfjs() {
   if (_pdfjsPromise) return _pdfjsPromise;
 
   _pdfjsPromise = (async () => {
-    const mod = await import("pdfjs-dist/build/pdf.mjs");
-    // Normalize in case bundler wraps exports
-    return mod?.default ?? mod;
+    // ✅ MUST use legacy build in Workers (avoids DOM/browser init paths)
+    const mod = await import("pdfjs-dist/legacy/build/pdf.mjs");
+    const pdfjs = mod?.default ?? mod;
+
+    // ✅ Ensure pdf.js does NOT try to load/spawn pdf.worker
+    // In Workers, we run everything in-process.
+    try {
+      if (pdfjs?.GlobalWorkerOptions) {
+        pdfjs.GlobalWorkerOptions.workerSrc = "";
+        pdfjs.GlobalWorkerOptions.workerPort = null;
+      }
+    } catch (_) {}
+
+    return pdfjs;
   })();
 
   return _pdfjsPromise;
 }
-
-
 
 export default {
   async fetch(request) {
@@ -63,9 +71,11 @@ export default {
 
         // Load PDF
         const tLoad0 = Date.now();
-        const loadingTask = pdfjsLib.getDocument({
-  data: pdfBytes,          // Uint8Array
-  disableWorker: true
+       const loadingTask = pdfjsLib.getDocument({
+  data: pdfBytes,            // Uint8Array is fine
+  disableWorker: true,       // ✅ required in Workers
+  isEvalSupported: false,    // optional hardening
+  useSystemFonts: true       // optional (helps text extraction)
 });
 
 
