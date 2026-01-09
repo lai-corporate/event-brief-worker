@@ -1,19 +1,25 @@
 // ✅ Deploy-safe pdf.js loader (lazy import)
-// - avoids Cloudflare deploy-time module evaluation crash
-// - caches the import so only loads once per isolate
+// IMPORTANT: do NOT define globalThis.window in Workers.
+// It can force pdfjs into "browser" mode and crash.
 let _pdfjsPromise = null;
 
 async function getPdfjs() {
   if (_pdfjsPromise) return _pdfjsPromise;
 
-  // Minimal polyfills pdfjs sometimes expects
-  globalThis.window ??= globalThis;
-  globalThis.navigator ??= { userAgent: "CloudflareWorkers" };
-  globalThis.location ??= new URL("https://example.com/");
+  _pdfjsPromise = (async () => {
+    // Workers already have fetch/URL/ReadableStream; don't fake DOM globals.
+    // Prefer non-legacy build first.
+    try {
+      return await import("pdfjs-dist/build/pdf.mjs");
+    } catch (e1) {
+      // Fallback to legacy if needed
+      return await import("pdfjs-dist/legacy/build/pdf.mjs");
+    }
+  })();
 
-  _pdfjsPromise = import("pdfjs-dist/legacy/build/pdf.mjs");
   return _pdfjsPromise;
 }
+
 
 export default {
   async fetch(request) {
@@ -63,9 +69,10 @@ export default {
         // Load PDF
         const tLoad0 = Date.now();
         const loadingTask = pdfjsLib.getDocument({
-          data: pdfBytes,
-          disableWorker: true
-        });
+  data: pdfBytes,          // Uint8Array
+  disableWorker: true
+});
+
 
         const pdf = await loadingTask.promise;
         const pdfLoadMs = Date.now() - tLoad0;
