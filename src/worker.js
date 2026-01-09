@@ -1,43 +1,42 @@
-console.log("✅ worker module evaluated", new Date().toISOString());
-// ---- Minimal DOM shim for pdfjs fake-worker (Cloudflare Workers) ----
-if (typeof globalThis.document === "undefined") {
-  globalThis.document = {
-    createElement: () => ({ style: {} })
-  };
-}
+import { init } from "@embedpdf/pdfium";
 
-let _pdfjsPromise = null;
+// PDFium wasm binary (fetched at runtime)
+const PDFIUM_WASM_URL = "https://cdn.jsdelivr.net/npm/@embedpdf/pdfium/dist/pdfium.wasm";
 
-async function getPdfjs() {
-  if (_pdfjsPromise) return _pdfjsPromise;
+// Cache pdfium instance across requests (per isolate)
+let _pdfiumPromise = null;
 
-  _pdfjsPromise = (async () => {
-    const mod = await import("pdfjs-dist/legacy/build/pdf.js");
-    const pdfjs = mod?.default ?? mod;
+async function getPdfium() {
+  if (_pdfiumPromise) return _pdfiumPromise;
 
-    if (pdfjs?.GlobalWorkerOptions) {
-      // Required in 3.x, but we won't actually load a worker
-      pdfjs.GlobalWorkerOptions.workerSrc = "data:application/javascript,";
-      // Some 3.x builds honor this internal switch
-      pdfjs.GlobalWorkerOptions.disableWorker = true;
-    }
+  _pdfiumPromise = (async () => {
+    const r = await fetch(PDFIUM_WASM_URL);
+    if (!r.ok) throw new Error(`pdfium_wasm_fetch_failed:${r.status}`);
 
-    return pdfjs;
+    const wasmBinary = await r.arrayBuffer();
+    const pdfium = await init({ wasmBinary });
+
+    // Required init call
+    pdfium.PDFiumExt_Init();
+
+    return pdfium;
   })();
 
-  return _pdfjsPromise;
+  return _pdfiumPromise;
 }
 
 export default {
   async fetch(request) {
-
-     // ✅ PROVE fetch is entered
+    // ✅ PROVE fetch is entered (keep while debugging)
     console.log("✅ fetch entered", request.method, request.url);
+
     const url = new URL(request.url);
     const qp = url.searchParams;
 
     const requestId =
-      (globalThis.crypto?.randomUUID ? crypto.randomUUID() : String(Date.now()) + "-" + Math.random().toString(16).slice(2));
+      (globalThis.crypto?.randomUUID
+        ? crypto.randomUUID()
+        : String(Date.now()) + "-" + Math.random().toString(16).slice(2));
 
     const debug = qp.get("debug") === "1" || qp.get("debug") === "true";
 
@@ -71,37 +70,19 @@ export default {
 
         log("pdf bytes", { length: pdfBytes.length, readMs });
 
-        // Lazy-load pdfjs
-        const tPdfjs0 = Date.now();
-        const pdfjsLib = await getPdfjs();
-        const pdfjsImportMs = Date.now() - tPdfjs0;
+        // Load PDFium
+        const tPdfium0 = Date.now();
+        const pdfium = await getPdfium();
+        const pdfiumInitMs = Date.now() - tPdfium0;
 
-        // Load PDF
-        const tLoad0 = Date.now();
-       const loadingTask = pdfjsLib.getDocument({
-  data: pdfBytes,
-  // ✅ Force NO worker + NO fake worker path
-  disableWorker: true,
-  worker: null,
-  useWorkerFetch: false,
-  isEvalSupported: false,
-  useSystemFonts: true
-});
-
-
-
-        const pdf = await loadingTask.promise;
-        const pdfLoadMs = Date.now() - tLoad0;
-
-        const totalPages = pdf.numPages;
-        const extractedPages = Math.min(totalPages, maxPages);
-
-        log("pdf loaded", { totalPages, extractedPages, pdfjsImportMs, pdfLoadMs });
-
-        // Extract text (capped)
+        // Extract text
         const tExtract0 = Date.now();
-        const { rawText, pages } = await extractPagesText(pdf, extractedPages);
+        const extractedPages = maxPages; // we cap inside extractor using actual page count
+        const { rawText, pages, totalPages, extractedPagesActual } =
+          await extractPagesTextPdfium(pdfium, pdfBytes, extractedPages);
         const extractMs = Date.now() - tExtract0;
+
+        log("pdf extracted", { totalPages, extractedPages: extractedPagesActual, pdfiumInitMs, extractMs });
 
         // Parse
         const tParse0 = Date.now();
@@ -117,11 +98,10 @@ export default {
             requestId,
             contentType: ct || null,
             totalPages,
-            extractedPages,
+            extractedPages: extractedPagesActual,
             timingsMs: {
               readMs,
-              pdfjsImportMs,
-              pdfLoadMs,
+              pdfiumInitMs,
               extractMs,
               parseMs,
               totalMs
@@ -135,7 +115,8 @@ export default {
         if (debug) {
           res.debug = {
             url: request.url,
-            notes: "Enable raw/pages with ?raw=1&pages=1. Default is optimized for Flow."
+            notes: "Enable raw/pages with ?raw=1&pages=1. Default is optimized for Flow.",
+            wasm: PDFIUM_WASM_URL
           };
         }
 
@@ -148,6 +129,7 @@ export default {
           stack: e?.stack,
           url: request.url
         });
+
         return json(
           {
             ok: false,
@@ -198,18 +180,86 @@ function base64ToUint8Array(b64) {
   return arr;
 }
 
-// Extract only N pages (already loaded pdf)
-async function extractPagesText(pdf, maxPages) {
-  const pages = [];
-  for (let p = 1; p <= maxPages; p++) {
-    const t0 = Date.now();
-    const page = await pdf.getPage(p);
-    const content = await page.getTextContent();
-    const text = content.items.map(i => i.str).join(" ");
-    pages.push({ page: p, text, ms: Date.now() - t0 });
+/**
+ * Extract only N pages using PDFium (WASM) – Worker safe
+ */
+async function extractPagesTextPdfium(pdfium, pdfBytes, maxPages) {
+  // Allocate memory for PDF bytes
+  const filePtr = pdfium.pdfium.wasmExports.malloc(pdfBytes.length);
+  pdfium.pdfium.HEAPU8.set(pdfBytes, filePtr);
+
+  const docPtr = pdfium.FPDF_LoadMemDocument(filePtr, pdfBytes.length, 0);
+
+  if (!docPtr) {
+    const err = pdfium.FPDF_GetLastError();
+    pdfium.pdfium.wasmExports.free(filePtr);
+
+    // 4 == password protected (common PDFium error code)
+    if (err === 4) throw new Error("pdf_password_protected");
+    throw new Error(`pdf_load_failed:${err}`);
   }
-  const rawText = pages.map(x => `\n\n=== PAGE ${x.page} ===\n${x.text}`).join("");
-  return { rawText, pages };
+
+  try {
+    const totalPages = pdfium.FPDF_GetPageCount(docPtr);
+    const pagesToRead = Math.min(totalPages, maxPages);
+
+    const pages = [];
+
+    for (let i = 0; i < pagesToRead; i++) {
+      const t0 = Date.now();
+
+      const pagePtr = pdfium.FPDF_LoadPage(docPtr, i);
+      if (!pagePtr) throw new Error(`pdf_load_page_failed:${i + 1}`);
+
+      try {
+        const textPagePtr = pdfium.FPDFText_LoadPage(pagePtr);
+        if (!textPagePtr) {
+          pages.push({ page: i + 1, text: "", ms: Date.now() - t0 });
+          continue;
+        }
+
+        try {
+          const charCount = pdfium.FPDFText_CountChars(textPagePtr);
+          if (charCount <= 0) {
+            pages.push({ page: i + 1, text: "", ms: Date.now() - t0 });
+            continue;
+          }
+
+          // UTF-16 buffer (+1 null terminator), 2 bytes per char
+          const bufferSize = (charCount + 1) * 2;
+          const textBufferPtr = pdfium.pdfium.wasmExports.malloc(bufferSize);
+
+          try {
+            const extractedLength = pdfium.FPDFText_GetText(
+              textPagePtr,
+              0,
+              charCount,
+              textBufferPtr
+            );
+
+            const text = extractedLength > 0
+              ? pdfium.pdfium.UTF16ToString(textBufferPtr)
+              : "";
+
+            pages.push({ page: i + 1, text, ms: Date.now() - t0 });
+          } finally {
+            pdfium.pdfium.wasmExports.free(textBufferPtr);
+          }
+        } finally {
+          pdfium.FPDFText_ClosePage(textPagePtr);
+        }
+      } finally {
+        pdfium.FPDF_ClosePage(pagePtr);
+      }
+    }
+
+    const rawText = pages.map(x => `\n\n=== PAGE ${x.page} ===\n${x.text}`).join("");
+    return { rawText, pages, totalPages, extractedPagesActual: pagesToRead };
+
+  } finally {
+    pdfium.FPDF_CloseDocument(docPtr);
+    pdfium.pdfium.wasmExports.free(filePtr);
+  }
 }
 
 /**
@@ -348,3 +398,4 @@ function json(obj, status = 200) {
     headers: { "content-type": "application/json; charset=utf-8" }
   });
 }
+
