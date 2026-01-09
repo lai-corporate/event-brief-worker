@@ -7,10 +7,12 @@
     "deploy": "wrangler deploy"
   },
   "dependencies": {
-    "pdfjs-dist": "4.8.69"
+    "pdfjs-dist": "3.11.174"
   },
   "devDependencies": {
     "wrangler": "^3.99.0"
   }
 }
+
+
 
