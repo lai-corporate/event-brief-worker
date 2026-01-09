@@ -1,33 +1,7 @@
-import { init } from "@embedpdf/pdfium";
-
-// PDFium wasm binary (fetched at runtime)
-const PDFIUM_WASM_URL = "https://cdn.jsdelivr.net/npm/@embedpdf/pdfium/dist/pdfium.wasm";
-
-// Cache pdfium instance across requests (per isolate)
-let _pdfiumPromise = null;
-
-async function getPdfium() {
-  if (_pdfiumPromise) return _pdfiumPromise;
-
-  _pdfiumPromise = (async () => {
-    const r = await fetch(PDFIUM_WASM_URL);
-    if (!r.ok) throw new Error(`pdfium_wasm_fetch_failed:${r.status}`);
-
-    const wasmBinary = await r.arrayBuffer();
-    const pdfium = await init({ wasmBinary });
-
-    // Required init call
-    pdfium.PDFiumExt_Init();
-
-    return pdfium;
-  })();
-
-  return _pdfiumPromise;
-}
+import { extractText } from "unpdf";
 
 export default {
   async fetch(request) {
-    // ✅ PROVE fetch is entered (keep while debugging)
     console.log("✅ fetch entered", request.method, request.url);
 
     const url = new URL(request.url);
@@ -40,7 +14,7 @@ export default {
 
     const debug = qp.get("debug") === "1" || qp.get("debug") === "true";
 
-    // Performance knobs (defaults are FLOW-friendly)
+    // Performance knobs
     const maxPages = clampInt(qp.get("maxPages"), 1, 10, 1); // default 1 page
     const includeRaw = qp.get("raw") === "1";                // default false
     const includePages = qp.get("pages") === "1";            // default false
@@ -54,7 +28,6 @@ export default {
       return new Response("OK");
     }
 
-    // POST PDF -> JSON
     if (request.method === "POST" && url.pathname === "/api/extract-all") {
       try {
         const ct = (request.headers.get("content-type") || "").toLowerCase();
@@ -70,19 +43,22 @@ export default {
 
         log("pdf bytes", { length: pdfBytes.length, readMs });
 
-        // Load PDFium
-        const tPdfium0 = Date.now();
-        const pdfium = await getPdfium();
-        const pdfiumInitMs = Date.now() - tPdfium0;
-
-        // Extract text
+        // ---- Extract text via unpdf (pure JS) ----
         const tExtract0 = Date.now();
-        const extractedPages = maxPages; // we cap inside extractor using actual page count
-        const { rawText, pages, totalPages, extractedPagesActual } =
-          await extractPagesTextPdfium(pdfium, pdfBytes, extractedPages);
-        const extractMs = Date.now() - tExtract0;
 
-        log("pdf extracted", { totalPages, extractedPages: extractedPagesActual, pdfiumInitMs, extractMs });
+        // unpdf expects ArrayBuffer/Uint8Array. We give Uint8Array.
+        // It returns a result with text and sometimes page grouping depending on version.
+        const result = await extractText(pdfBytes);
+
+        // Normalize into our format
+        const fullText = normalize(String(result?.text || ""));
+
+        // If we need pages, best-effort split:
+        // unpdf doesn’t always return per-page segmentation; we emulate “page 1..N” by
+        // splitting on formfeed or using a chunk heuristic.
+        const { rawText, pages, extractedPages } = buildPagedText(fullText, maxPages);
+
+        const extractMs = Date.now() - tExtract0;
 
         // Parse
         const tParse0 = Date.now();
@@ -97,11 +73,9 @@ export default {
           meta: {
             requestId,
             contentType: ct || null,
-            totalPages,
-            extractedPages: extractedPagesActual,
+            extractedPages,
             timingsMs: {
               readMs,
-              pdfiumInitMs,
               extractMs,
               parseMs,
               totalMs
@@ -115,8 +89,7 @@ export default {
         if (debug) {
           res.debug = {
             url: request.url,
-            notes: "Enable raw/pages with ?raw=1&pages=1. Default is optimized for Flow.",
-            wasm: PDFIUM_WASM_URL
+            notes: "unpdf is pure JS; paging is best-effort if the PDF text has no page separators."
           };
         }
 
@@ -154,25 +127,19 @@ function clampInt(v, min, max, def) {
   return Math.max(min, Math.min(max, Math.floor(n)));
 }
 
-// Reads either raw bytes OR Power Automate JSON wrapper { $content }
 async function readPdfBytes(request, contentType, log) {
-  // If Flow accidentally sends JSON (Power Automate wrapper), handle it.
   if (contentType.includes("application/json")) {
     const j = await request.json();
     const b64 = j?.$content || j?.content || null;
     if (!b64) return null;
-
     log("json wrapper detected", { hasContent: !!b64, contentType });
     return base64ToUint8Array(b64);
   }
-
-  // Raw bytes path (preferred)
   const buf = await request.arrayBuffer();
   return new Uint8Array(buf);
 }
 
 function base64ToUint8Array(b64) {
-  // b64 may include data-url prefix; strip if present
   const clean = String(b64 || "").replace(/^data:.*?;base64,/, "");
   const bin = atob(clean);
   const arr = new Uint8Array(bin.length);
@@ -180,100 +147,28 @@ function base64ToUint8Array(b64) {
   return arr;
 }
 
-/**
- * Extract only N pages using PDFium (WASM) – Worker safe
- */
-async function extractPagesTextPdfium(pdfium, pdfBytes, maxPages) {
-  // Allocate memory for PDF bytes
-  const filePtr = pdfium.pdfium.wasmExports.malloc(pdfBytes.length);
-  pdfium.pdfium.HEAPU8.set(pdfBytes, filePtr);
+function buildPagedText(fullText, maxPages) {
+  // Some PDFs include formfeed separators \f between pages.
+  const chunks = fullText.split("\f").map(s => s.trim()).filter(Boolean);
 
-  const docPtr = pdfium.FPDF_LoadMemDocument(filePtr, pdfBytes.length, 0);
-
-  if (!docPtr) {
-    const err = pdfium.FPDF_GetLastError();
-    pdfium.pdfium.wasmExports.free(filePtr);
-
-    // 4 == password protected (common PDFium error code)
-    if (err === 4) throw new Error("pdf_password_protected");
-    throw new Error(`pdf_load_failed:${err}`);
+  let pages = [];
+  if (chunks.length >= 2) {
+    const take = Math.min(chunks.length, maxPages);
+    pages = chunks.slice(0, take).map((text, idx) => ({ page: idx + 1, text, ms: 0 }));
+  } else {
+    // Fallback: no page separators. Treat everything as page 1.
+    pages = [{ page: 1, text: fullText, ms: 0 }];
   }
 
-  try {
-    const totalPages = pdfium.FPDF_GetPageCount(docPtr);
-    const pagesToRead = Math.min(totalPages, maxPages);
-
-    const pages = [];
-
-    for (let i = 0; i < pagesToRead; i++) {
-      const t0 = Date.now();
-
-      const pagePtr = pdfium.FPDF_LoadPage(docPtr, i);
-      if (!pagePtr) throw new Error(`pdf_load_page_failed:${i + 1}`);
-
-      try {
-        const textPagePtr = pdfium.FPDFText_LoadPage(pagePtr);
-        if (!textPagePtr) {
-          pages.push({ page: i + 1, text: "", ms: Date.now() - t0 });
-          continue;
-        }
-
-        try {
-          const charCount = pdfium.FPDFText_CountChars(textPagePtr);
-          if (charCount <= 0) {
-            pages.push({ page: i + 1, text: "", ms: Date.now() - t0 });
-            continue;
-          }
-
-          // UTF-16 buffer (+1 null terminator), 2 bytes per char
-          const bufferSize = (charCount + 1) * 2;
-          const textBufferPtr = pdfium.pdfium.wasmExports.malloc(bufferSize);
-
-          try {
-            const extractedLength = pdfium.FPDFText_GetText(
-              textPagePtr,
-              0,
-              charCount,
-              textBufferPtr
-            );
-
-            const text = extractedLength > 0
-              ? pdfium.pdfium.UTF16ToString(textBufferPtr)
-              : "";
-
-            pages.push({ page: i + 1, text, ms: Date.now() - t0 });
-          } finally {
-            pdfium.pdfium.wasmExports.free(textBufferPtr);
-          }
-        } finally {
-          pdfium.FPDFText_ClosePage(textPagePtr);
-        }
-      } finally {
-        pdfium.FPDF_ClosePage(pagePtr);
-      }
-    }
-
-    const rawText = pages.map(x => `\n\n=== PAGE ${x.page} ===\n${x.text}`).join("");
-    return { rawText, pages, totalPages, extractedPagesActual: pagesToRead };
-
-  } finally {
-    pdfium.FPDF_CloseDocument(docPtr);
-    pdfium.pdfium.wasmExports.free(filePtr);
-  }
+  const rawText = pages.map(x => `\n\n=== PAGE ${x.page} ===\n${x.text}`).join("");
+  return { rawText, pages, extractedPages: pages.length };
 }
 
-/**
- * Parse fields we can reliably pull from LAI Event Brief PDFs
- * (still returns rawText so you never lose data)
- */
 function parseLaiEventBrief(rawText) {
   const t = normalize(rawText);
 
-  // Header fields
   const bookingNumber = match1(t, /Booking\s*#\s*(\d{5,12})/i);
 
-  // Between divider and CONTACT INFORMATION we usually have:
-  // talent, client, event name, date
   const headerBlock = matchBlock(t, /-\s*-\s*-\s*\n([\s\S]*?)\nCONTACT INFORMATION/i);
   let talentName = null, clientName = null, eventTitle = null, eventDateText = null;
   if (headerBlock) {
@@ -284,7 +179,6 @@ function parseLaiEventBrief(rawText) {
     eventDateText = lines[3] || null;
   }
 
-  // Venue/hotel site block
   const venueBlock = matchBlock(t, /EVENT\/HOTEL SITE:\s*([\s\S]*?)\nCLIENT ONSITE CONTACT:/i);
   const venueName = venueBlock ? match1(venueBlock, /^(.+?)\n/) : null;
 
@@ -299,7 +193,6 @@ function parseLaiEventBrief(rawText) {
     billingNotes: matchBlock(venueBlock, /Confirmation number:.*?\n([\s\S]*?)$/i) || null
   } : null;
 
-  // Contacts blocks
   const clientOnsiteBlock = matchBlock(t, /CLIENT ONSITE CONTACT:\s*([\s\S]*?)\nLEADING AUTHORITIES\s*CONTACTS:/i);
   const clientOnsite = clientOnsiteBlock ? {
     raw: clientOnsiteBlock,
@@ -312,8 +205,8 @@ function parseLaiEventBrief(rawText) {
   const laiContactsBlock = matchBlock(t, /LEADING AUTHORITIES\s*CONTACTS:\s*([\s\S]*?)\nTALENT CONTACT:/i);
   const laiContacts = [];
   if (laiContactsBlock) {
-    const chunks = laiContactsBlock.split(/\n(?=[A-Z][a-zA-Z]+.*?,\s)/).map(s => s.trim()).filter(Boolean);
-    for (const c of chunks) {
+    const chunks2 = laiContactsBlock.split(/\n(?=[A-Z][a-zA-Z]+.*?,\s)/).map(s => s.trim()).filter(Boolean);
+    for (const c of chunks2) {
       laiContacts.push({
         raw: c,
         nameTitle: match1(c, /^(.+?)(?:\nOffice:|$)/i),
@@ -336,7 +229,6 @@ function parseLaiEventBrief(rawText) {
     phone: match1(emergencyBlock, /Phone:\s*(\(\d{3}\)\s*\d{3}-\d{4})/i),
   } : null;
 
-  // Schedule section (best-effort)
   const scheduleBlock = matchBlock(t, /SCHEDULE OF EVENTS\s*([\s\S]*?)\n- - -\nEVENT DETAILS/i);
   const flights = [];
   if (scheduleBlock) {
@@ -398,4 +290,5 @@ function json(obj, status = 200) {
     headers: { "content-type": "application/json; charset=utf-8" }
   });
 }
+
 
