@@ -18,49 +18,172 @@ async function getPdfjs() {
 export default {
   async fetch(request) {
     const url = new URL(request.url);
+    const qp = url.searchParams;
+
+    const requestId =
+      (globalThis.crypto?.randomUUID ? crypto.randomUUID() : String(Date.now()) + "-" + Math.random().toString(16).slice(2));
+
+    const debug = qp.get("debug") === "1" || qp.get("debug") === "true";
+
+    // Performance knobs (defaults are FLOW-friendly)
+    const maxPages = clampInt(qp.get("maxPages"), 1, 10, 1); // default 1 page
+    const includeRaw = qp.get("raw") === "1";                // default false
+    const includePages = qp.get("pages") === "1";            // default false
+
+    const t0 = Date.now();
+    const log = (...args) => { if (debug) console.log(`[${requestId}]`, ...args); };
+    const errlog = (...args) => console.error(`[${requestId}]`, ...args);
 
     // Health check
     if (request.method === "GET" && url.pathname === "/") {
       return new Response("OK");
     }
 
-    // POST raw PDF bytes -> JSON
+    // POST PDF -> JSON
     if (request.method === "POST" && url.pathname === "/api/extract-all") {
-      const buf = await request.arrayBuffer();
-      if (!buf || buf.byteLength < 10) return json({ ok: false, error: "empty_body" }, 400);
+      try {
+        const ct = (request.headers.get("content-type") || "").toLowerCase();
+        log("incoming", { method: request.method, path: url.pathname, ct, maxPages, includeRaw, includePages });
 
-      // ✅ Lazy-load pdfjs here
-      const pdfjsLib = await getPdfjs();
+        const tRead0 = Date.now();
+        const pdfBytes = await readPdfBytes(request, ct, log);
+        const readMs = Date.now() - tRead0;
 
-      // ✅ Important: disableWorker in Workers runtime
-      const loadingTask = pdfjsLib.getDocument({
-        data: new Uint8Array(buf),
-        disableWorker: true
-      });
+        if (!pdfBytes || pdfBytes.length < 10) {
+          return json({ ok: false, error: "empty_body", meta: { requestId } }, 400);
+        }
 
-      const pdf = await loadingTask.promise;
+        log("pdf bytes", { length: pdfBytes.length, readMs });
 
-      // 1) Extract text from ALL pages
-      const { rawText, pages } = await extractAllPagesText(pdf);
+        // Lazy-load pdfjs
+        const tPdfjs0 = Date.now();
+        const pdfjsLib = await getPdfjs();
+        const pdfjsImportMs = Date.now() - tPdfjs0;
 
-      // 2) Best-effort parse
-      const parsed = parseLaiEventBrief(rawText);
+        // Load PDF
+        const tLoad0 = Date.now();
+        const loadingTask = pdfjsLib.getDocument({
+          data: pdfBytes,
+          disableWorker: true
+        });
 
-      return json({ ok: true, parsed, pages, rawText });
+        const pdf = await loadingTask.promise;
+        const pdfLoadMs = Date.now() - tLoad0;
+
+        const totalPages = pdf.numPages;
+        const extractedPages = Math.min(totalPages, maxPages);
+
+        log("pdf loaded", { totalPages, extractedPages, pdfjsImportMs, pdfLoadMs });
+
+        // Extract text (capped)
+        const tExtract0 = Date.now();
+        const { rawText, pages } = await extractPagesText(pdf, extractedPages);
+        const extractMs = Date.now() - tExtract0;
+
+        // Parse
+        const tParse0 = Date.now();
+        const parsed = parseLaiEventBrief(rawText);
+        const parseMs = Date.now() - tParse0;
+
+        const totalMs = Date.now() - t0;
+
+        const res = {
+          ok: true,
+          parsed,
+          meta: {
+            requestId,
+            contentType: ct || null,
+            totalPages,
+            extractedPages,
+            timingsMs: {
+              readMs,
+              pdfjsImportMs,
+              pdfLoadMs,
+              extractMs,
+              parseMs,
+              totalMs
+            }
+          }
+        };
+
+        if (includePages) res.pages = pages;
+        if (includeRaw) res.rawText = rawText;
+
+        if (debug) {
+          res.debug = {
+            url: request.url,
+            notes: "Enable raw/pages with ?raw=1&pages=1. Default is optimized for Flow."
+          };
+        }
+
+        log("success", { bookingNumber: parsed?.bookingNumber, totalMs });
+        return json(res);
+
+      } catch (e) {
+        errlog("extract_failed", {
+          message: e?.message,
+          stack: e?.stack,
+          url: request.url
+        });
+        return json(
+          {
+            ok: false,
+            error: "extract_failed",
+            message: String(e?.message || e),
+            meta: { requestId }
+          },
+          500
+        );
+      }
     }
 
     return new Response("Not found", { status: 404 });
   }
 };
 
-// Updated: accept already-loaded pdf instance (avoids re-loading)
-async function extractAllPagesText(pdf) {
+// ---------- helpers ----------
+
+function clampInt(v, min, max, def) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return def;
+  return Math.max(min, Math.min(max, Math.floor(n)));
+}
+
+// Reads either raw bytes OR Power Automate JSON wrapper { $content }
+async function readPdfBytes(request, contentType, log) {
+  // If Flow accidentally sends JSON (Power Automate wrapper), handle it.
+  if (contentType.includes("application/json")) {
+    const j = await request.json();
+    const b64 = j?.$content || j?.content || null;
+    if (!b64) return null;
+
+    log("json wrapper detected", { hasContent: !!b64, contentType });
+    return base64ToUint8Array(b64);
+  }
+
+  // Raw bytes path (preferred)
+  const buf = await request.arrayBuffer();
+  return new Uint8Array(buf);
+}
+
+function base64ToUint8Array(b64) {
+  // b64 may include data-url prefix; strip if present
+  const clean = String(b64 || "").replace(/^data:.*?;base64,/, "");
+  const bin = atob(clean);
+  const arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  return arr;
+}
+
+// Extract only N pages (already loaded pdf)
+async function extractPagesText(pdf, maxPages) {
   const pages = [];
-  for (let p = 1; p <= pdf.numPages; p++) {
+  for (let p = 1; p <= maxPages; p++) {
+    const t0 = Date.now();
     const page = await pdf.getPage(p);
     const content = await page.getTextContent();
     const text = content.items.map(i => i.str).join(" ");
-    pages.push({ page: p, text });
+    pages.push({ page: p, text, ms: Date.now() - t0 });
   }
   const rawText = pages.map(x => `\n\n=== PAGE ${x.page} ===\n${x.text}`).join("");
   return { rawText, pages };
@@ -202,4 +325,3 @@ function json(obj, status = 200) {
     headers: { "content-type": "application/json; charset=utf-8" }
   });
 }
-
