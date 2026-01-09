@@ -1,4 +1,10 @@
 console.log("✅ worker module evaluated", new Date().toISOString());
+// ---- Minimal DOM shim for pdfjs fake-worker (Cloudflare Workers) ----
+if (typeof globalThis.document === "undefined") {
+  globalThis.document = {
+    createElement: () => ({ style: {} })
+  };
+}
 
 let _pdfjsPromise = null;
 
