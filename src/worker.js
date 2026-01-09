@@ -14,9 +14,10 @@ async function getPdfjs() {
     // ✅ Ensure pdf.js does NOT try to load/spawn pdf.worker
     try {
       if (pdfjs?.GlobalWorkerOptions) {
-        pdfjs.GlobalWorkerOptions.workerSrc = "";
-        pdfjs.GlobalWorkerOptions.workerPort = null;
-      }
+  // pdfjs 3.x REQUIRES a workerSrc, even if workers are disabled
+  pdfjs.GlobalWorkerOptions.workerSrc = "data:application/javascript,";
+}
+
     } catch (_) {}
 
     return pdfjs;
@@ -77,10 +78,8 @@ export default {
         // Load PDF
         const tLoad0 = Date.now();
        const loadingTask = pdfjsLib.getDocument({
-  data: pdfBytes,            // Uint8Array is fine
-  disableWorker: true,       // ✅ required in Workers
-  isEvalSupported: false,    // optional hardening
-  useSystemFonts: true       // optional (helps text extraction)
+  data: pdfBytes,
+  worker: null // ✅ REQUIRED in pdfjs-dist 3.x
 });
 
 
