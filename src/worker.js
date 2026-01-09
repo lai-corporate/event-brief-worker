@@ -1,31 +1,26 @@
 console.log("✅ worker module evaluated", new Date().toISOString());
 
-// ✅ Deploy-safe pdf.js loader (lazy import) for Cloudflare Workers
 let _pdfjsPromise = null;
 
 async function getPdfjs() {
   if (_pdfjsPromise) return _pdfjsPromise;
 
   _pdfjsPromise = (async () => {
-    // ✅ pdfjs-dist 3.x legacy build is .js (not .mjs)
     const mod = await import("pdfjs-dist/legacy/build/pdf.js");
     const pdfjs = mod?.default ?? mod;
 
-    // ✅ Ensure pdf.js does NOT try to load/spawn pdf.worker
-    try {
-      if (pdfjs?.GlobalWorkerOptions) {
-  // pdfjs 3.x REQUIRES a workerSrc, even if workers are disabled
-  pdfjs.GlobalWorkerOptions.workerSrc = "data:application/javascript,";
-}
-
-    } catch (_) {}
+    if (pdfjs?.GlobalWorkerOptions) {
+      // Required in 3.x, but we won't actually load a worker
+      pdfjs.GlobalWorkerOptions.workerSrc = "data:application/javascript,";
+      // Some 3.x builds honor this internal switch
+      pdfjs.GlobalWorkerOptions.disableWorker = true;
+    }
 
     return pdfjs;
   })();
 
   return _pdfjsPromise;
 }
-
 
 export default {
   async fetch(request) {
@@ -79,8 +74,14 @@ export default {
         const tLoad0 = Date.now();
        const loadingTask = pdfjsLib.getDocument({
   data: pdfBytes,
-  worker: null // ✅ REQUIRED in pdfjs-dist 3.x
+  // ✅ Force NO worker + NO fake worker path
+  disableWorker: true,
+  worker: null,
+  useWorkerFetch: false,
+  isEvalSupported: false,
+  useSystemFonts: true
 });
+
 
 
         const pdf = await loadingTask.promise;
