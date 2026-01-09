@@ -1,3 +1,5 @@
+console.log("✅ worker module evaluated", new Date().toISOString());
+
 // ✅ Deploy-safe pdf.js loader (lazy import) for Cloudflare Workers
 let _pdfjsPromise = null;
 
@@ -26,6 +28,9 @@ async function getPdfjs() {
 
 export default {
   async fetch(request) {
+
+     // ✅ PROVE fetch is entered
+    console.log("✅ fetch entered", request.method, request.url);
     const url = new URL(request.url);
     const qp = url.searchParams;
 
