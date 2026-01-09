@@ -7,12 +7,11 @@ async function getPdfjs() {
   if (_pdfjsPromise) return _pdfjsPromise;
 
   _pdfjsPromise = (async () => {
-    // ✅ MUST use legacy build in Workers (avoids DOM/browser init paths)
-    const mod = await import("pdfjs-dist/legacy/build/pdf.mjs");
+    // ✅ pdfjs-dist 3.x legacy build is .js (not .mjs)
+    const mod = await import("pdfjs-dist/legacy/build/pdf.js");
     const pdfjs = mod?.default ?? mod;
 
     // ✅ Ensure pdf.js does NOT try to load/spawn pdf.worker
-    // In Workers, we run everything in-process.
     try {
       if (pdfjs?.GlobalWorkerOptions) {
         pdfjs.GlobalWorkerOptions.workerSrc = "";
@@ -25,6 +24,7 @@ async function getPdfjs() {
 
   return _pdfjsPromise;
 }
+
 
 export default {
   async fetch(request) {
