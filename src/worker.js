@@ -45,19 +45,9 @@ export default {
 
         // ---- Extract text via unpdf (pure JS) ----
         const tExtract0 = Date.now();
-
-        // unpdf expects ArrayBuffer/Uint8Array. We give Uint8Array.
-        // It returns a result with text and sometimes page grouping depending on version.
         const result = await extractText(pdfBytes);
-
-        // Normalize into our format
         const fullText = normalize(String(result?.text || ""));
-
-        // If we need pages, best-effort split:
-        // unpdf doesn’t always return per-page segmentation; we emulate “page 1..N” by
-        // splitting on formfeed or using a chunk heuristic.
         const { rawText, pages, extractedPages } = buildPagedText(fullText, maxPages);
-
         const extractMs = Date.now() - tExtract0;
 
         // Parse
@@ -147,28 +137,54 @@ function base64ToUint8Array(b64) {
   return arr;
 }
 
+/**
+ * Best-effort paging.
+ * 1) If text contains \f form-feed, use that.
+ * 2) Else if it contains "Page X of Y", split on those markers.
+ * 3) Else treat as single page.
+ */
 function buildPagedText(fullText, maxPages) {
-  // Some PDFs include formfeed separators \f between pages.
-  const chunks = fullText.split("\f").map(s => s.trim()).filter(Boolean);
+  const text = String(fullText || "").trim();
 
-  let pages = [];
-  if (chunks.length >= 2) {
-    const take = Math.min(chunks.length, maxPages);
-    pages = chunks.slice(0, take).map((text, idx) => ({ page: idx + 1, text, ms: 0 }));
-  } else {
-    // Fallback: no page separators. Treat everything as page 1.
-    pages = [{ page: 1, text: fullText, ms: 0 }];
+  // 1) Form-feed based
+  const ffChunks = text.split("\f").map(s => s.trim()).filter(Boolean);
+  if (ffChunks.length >= 2) {
+    const take = Math.min(ffChunks.length, maxPages);
+    const pages = ffChunks.slice(0, take).map((t, i) => ({ page: i + 1, text: t, ms: 0 }));
+    const rawText = pages.map(x => `\n\n=== PAGE ${x.page} ===\n${x.text}`).join("");
+    return { rawText, pages, extractedPages: pages.length };
   }
 
-  const rawText = pages.map(x => `\n\n=== PAGE ${x.page} ===\n${x.text}`).join("");
-  return { rawText, pages, extractedPages: pages.length };
+  // 2) "Page X of Y" markers (your Event Briefs have these inline)
+  // Split BEFORE each "Page N of M" marker (except if it's at very start)
+  const markerRe = /(?=\bPage\s+\d+\s+of\s+\d+\b)/gi;
+  const markerChunks = text.split(markerRe).map(s => s.trim()).filter(Boolean);
+
+  if (markerChunks.length >= 2) {
+    // The first chunk might be "Page 2 of 4 ..." etc; treat each chunk as a page-ish segment.
+    const take = Math.min(markerChunks.length, maxPages);
+    const pages = markerChunks.slice(0, take).map((t, i) => ({ page: i + 1, text: t, ms: 0 }));
+    const rawText = pages.map(x => `\n\n=== PAGE ${x.page} ===\n${x.text}`).join("");
+    return { rawText, pages, extractedPages: pages.length };
+  }
+
+  // 3) single page fallback
+  const pages = [{ page: 1, text, ms: 0 }];
+  const rawText = `\n\n=== PAGE 1 ===\n${text}`;
+  return { rawText, pages, extractedPages: 1 };
 }
 
+/**
+ * Parse fields we can reliably pull from LAI Event Brief PDFs
+ */
 function parseLaiEventBrief(rawText) {
   const t = normalize(rawText);
 
+  // Header fields
   const bookingNumber = match1(t, /Booking\s*#\s*(\d{5,12})/i);
 
+  // Between divider and CONTACT INFORMATION we usually have:
+  // talent, client, event name, date
   const headerBlock = matchBlock(t, /-\s*-\s*-\s*\n([\s\S]*?)\nCONTACT INFORMATION/i);
   let talentName = null, clientName = null, eventTitle = null, eventDateText = null;
   if (headerBlock) {
@@ -179,21 +195,56 @@ function parseLaiEventBrief(rawText) {
     eventDateText = lines[3] || null;
   }
 
-  const venueBlock = matchBlock(t, /EVENT\/HOTEL SITE:\s*([\s\S]*?)\nCLIENT ONSITE CONTACT:/i);
-  const venueName = venueBlock ? match1(venueBlock, /^(.+?)\n/) : null;
+  // Grab full CONTACT INFORMATION block (newer template is label-driven)
+  const contactInfoBlock = matchBlock(t, /CONTACT INFORMATION\s*([\s\S]*?)\nSCHEDULE OF EVENTS/i);
 
-  const venue = venueBlock ? {
-    raw: venueBlock,
+  // Helper to slice between labels
+  function sectionBetween(block, startLabel, endLabel) {
+    if (!block) return null;
+    const re = new RegExp(`${startLabel}:\\s*([\\s\\S]*?)\\n${endLabel}:`, "i");
+    const m = block.match(re);
+    return m ? m[1].trim() : null;
+  }
+  function sectionToEnd(block, startLabel) {
+    if (!block) return null;
+    const re = new RegExp(`${startLabel}:\\s*([\\s\\S]*)$`, "i");
+    const m = block.match(re);
+    return m ? m[1].trim() : null;
+  }
+
+  // Venue/event site block supports both "EVENT SITE" and older "EVENT/HOTEL SITE"
+  const eventSiteBlock =
+    sectionBetween(contactInfoBlock, "EVENT SITE", "CLIENT ONSITE CONTACT") ||
+    sectionBetween(contactInfoBlock, "EVENT\\/HOTEL SITE", "CLIENT ONSITE CONTACT");
+
+  const clientOnsiteBlock =
+    sectionBetween(contactInfoBlock, "CLIENT ONSITE CONTACT", "LEADING AUTHORITIES\\s*CONTACTS") ||
+    sectionBetween(contactInfoBlock, "CLIENT ONSITE CONTACT", "LEADING AUTHORITIES CONTACTS");
+
+  const laiContactsBlock =
+    sectionBetween(contactInfoBlock, "LEADING AUTHORITIES\\s*CONTACTS", "TALENT CONTACT") ||
+    sectionBetween(contactInfoBlock, "LEADING AUTHORITIES CONTACTS", "TALENT CONTACT");
+
+  // Talent contact sometimes ends with "**Day of, Urgent Use Only**"
+  const talentBlock =
+    sectionBetween(contactInfoBlock, "TALENT CONTACT", "\\*\\*Day of, Urgent Use Only\\*\\*") ||
+    sectionToEnd(contactInfoBlock, "TALENT CONTACT");
+
+  // Build venue
+  const venueName = eventSiteBlock ? match1(eventSiteBlock, /^(.+?)\n/) : null;
+
+  const venue = eventSiteBlock ? {
+    raw: eventSiteBlock,
     name: venueName,
-    phone: match1(venueBlock, /Phone:\s*(\(\d{3}\)\s*\d{3}-\d{4})/i),
-    nights: match1(venueBlock, /(\d+)\s+nights?\s+stay/i),
-    checkIn: match1(venueBlock, /Check-in date:\s*([0-9]{1,2}\/[0-9]{1,2}\/[0-9]{4})/i),
-    checkOut: match1(venueBlock, /Check-out date:\s*([0-9]{1,2}\/[0-9]{1,2}\/[0-9]{4})/i),
-    confirmationNumber: match1(venueBlock, /Confirmation number:\s*([0-9]+)/i),
-    billingNotes: matchBlock(venueBlock, /Confirmation number:.*?\n([\s\S]*?)$/i) || null
+    phone: match1(eventSiteBlock, /Phone:\s*(\(\d{3}\)\s*\d{3}-\d{4})/i),
+    address: (() => {
+      const lines = eventSiteBlock.split("\n").map(s => s.trim()).filter(Boolean);
+      // Usually: name, street, city/state/zip, Phone...
+      return lines.slice(0, 3).join(", ");
+    })()
   } : null;
 
-  const clientOnsiteBlock = matchBlock(t, /CLIENT ONSITE CONTACT:\s*([\s\S]*?)\nLEADING AUTHORITIES\s*CONTACTS:/i);
+  // Client onsite contact
   const clientOnsite = clientOnsiteBlock ? {
     raw: clientOnsiteBlock,
     nameTitle: match1(clientOnsiteBlock, /^(.+?)(?:\nOffice:|\nCell:|\nEmail:|$)/i),
@@ -202,11 +253,15 @@ function parseLaiEventBrief(rawText) {
     email: match1(clientOnsiteBlock, /Email:\s*([^\s]+@[^\s]+)/i),
   } : null;
 
-  const laiContactsBlock = matchBlock(t, /LEADING AUTHORITIES\s*CONTACTS:\s*([\s\S]*?)\nTALENT CONTACT:/i);
+  // LAI contacts (may be multiple)
   const laiContacts = [];
   if (laiContactsBlock) {
-    const chunks2 = laiContactsBlock.split(/\n(?=[A-Z][a-zA-Z]+.*?,\s)/).map(s => s.trim()).filter(Boolean);
-    for (const c of chunks2) {
+    const chunks = laiContactsBlock
+      .split(/\n(?=[A-Z][a-zA-Z]+.*?,\s)/)
+      .map(s => s.trim())
+      .filter(Boolean);
+
+    for (const c of chunks) {
       laiContacts.push({
         raw: c,
         nameTitle: match1(c, /^(.+?)(?:\nOffice:|$)/i),
@@ -216,19 +271,21 @@ function parseLaiEventBrief(rawText) {
     }
   }
 
-  const talentBlock = matchBlock(t, /TALENT CONTACT:\s*([\s\S]*?)\nEMERGENCY TRAVEL/i);
+  // Talent contact
   const talentContact = talentBlock ? {
     raw: talentBlock,
     name: match1(talentBlock, /^(.+?)\n/i),
     cell: match1(talentBlock, /Cell:\s*(\(\d{3}\)\s*\d{3}-\d{4})/i),
   } : null;
 
+  // Emergency block (best-effort)
   const emergencyBlock = matchBlock(t, /EMERGENCY TRAVEL\s*NUMBERS:\s*([\s\S]*?)(?:\n=== PAGE 2 ===|\nSCHEDULE OF EVENTS|$)/i);
   const emergencyTravel = emergencyBlock ? {
     raw: emergencyBlock,
     phone: match1(emergencyBlock, /Phone:\s*(\(\d{3}\)\s*\d{3}-\d{4})/i),
   } : null;
 
+  // Schedule section (best-effort)
   const scheduleBlock = matchBlock(t, /SCHEDULE OF EVENTS\s*([\s\S]*?)\n- - -\nEVENT DETAILS/i);
   const flights = [];
   if (scheduleBlock) {
@@ -290,5 +347,3 @@ function json(obj, status = 200) {
     headers: { "content-type": "application/json; charset=utf-8" }
   });
 }
-
-
