@@ -64,12 +64,7 @@ export default {
             requestId,
             contentType: ct || null,
             extractedPages,
-            timingsMs: {
-              readMs,
-              extractMs,
-              parseMs,
-              totalMs
-            }
+            timingsMs: { readMs, extractMs, parseMs, totalMs }
           }
         };
 
@@ -79,7 +74,8 @@ export default {
         if (debug) {
           res.debug = {
             url: request.url,
-            notes: "unpdf is pure JS; paging is best-effort if the PDF text has no page separators."
+            notes:
+              "unpdf is pure JS; paging is best-effort if the PDF text has no page separators. Parser is label/section driven to tolerate template changes."
           };
         }
 
@@ -155,13 +151,11 @@ function buildPagedText(fullText, maxPages) {
     return { rawText, pages, extractedPages: pages.length };
   }
 
-  // 2) "Page X of Y" markers (your Event Briefs have these inline)
-  // Split BEFORE each "Page N of M" marker (except if it's at very start)
+  // 2) "Page X of Y" markers
   const markerRe = /(?=\bPage\s+\d+\s+of\s+\d+\b)/gi;
   const markerChunks = text.split(markerRe).map(s => s.trim()).filter(Boolean);
 
   if (markerChunks.length >= 2) {
-    // The first chunk might be "Page 2 of 4 ..." etc; treat each chunk as a page-ish segment.
     const take = Math.min(markerChunks.length, maxPages);
     const pages = markerChunks.slice(0, take).map((t, i) => ({ page: i + 1, text: t, ms: 0 }));
     const rawText = pages.map(x => `\n\n=== PAGE ${x.page} ===\n${x.text}`).join("");
@@ -176,151 +170,447 @@ function buildPagedText(fullText, maxPages) {
 
 /**
  * Parse fields we can reliably pull from LAI Event Brief PDFs
+ * Output is stable even if fields are missing/renamed.
  */
 function parseLaiEventBrief(rawText) {
   const t = normalize(rawText);
 
-  // Header fields
+  // ---- 1) Basic header facts (booking # is usually reliable) ----
   const bookingNumber = match1(t, /Booking\s*#\s*(\d{5,12})/i);
 
-  // Between divider and CONTACT INFORMATION we usually have:
-  // talent, client, event name, date
+  // ---- 2) Segment into sections by headings (supports variants + repeated headings) ----
+  const sectionMap = splitByHeadingsMulti(t, [
+    "CONTACT INFORMATION",
+    "SCHEDULE OF EVENTS",
+    "EVENT DETAILS",
+    "CLIENT DETAILS",
+    "EVENT AGENDA",
+    "TALENT INTRODUCTION",
+    "EMERGENCY TRAVEL NUMBERS",
+    "STAGE DIAGRAM",
+    "COX CAMPUS MAP"
+  ]);
+
+  const contactBlock = (sectionMap["CONTACT INFORMATION"]?.[0] || "");
+
+  // ---- 3) Parse header block (don’t rely on fixed indices) ----
   const headerBlock = matchBlock(t, /-\s*-\s*-\s*\n([\s\S]*?)\nCONTACT INFORMATION/i);
-  let talentName = null, clientName = null, eventTitle = null, eventDateText = null;
-  if (headerBlock) {
-    const lines = headerBlock.split("\n").map(x => x.trim()).filter(Boolean);
-    talentName = lines[0] || null;
-    clientName = lines[1] || null;
-    eventTitle = lines[2] || null;
-    eventDateText = lines[3] || null;
-  }
+  const header = parseHeaderBlock(headerBlock);
 
-  // Grab full CONTACT INFORMATION block (newer template is label-driven)
-  const contactInfoBlock = matchBlock(t, /CONTACT INFORMATION\s*([\s\S]*?)\nSCHEDULE OF EVENTS/i);
+  // ---- 4) Parse sites ----
+  const sites = parseSitesFromContactInfo(contactBlock);
 
-  // Helper to slice between labels
-  function sectionBetween(block, startLabel, endLabel) {
-    if (!block) return null;
-    const re = new RegExp(`${startLabel}:\\s*([\\s\\S]*?)\\n${endLabel}:`, "i");
-    const m = block.match(re);
-    return m ? m[1].trim() : null;
-  }
-  function sectionToEnd(block, startLabel) {
-    if (!block) return null;
-    const re = new RegExp(`${startLabel}:\\s*([\\s\\S]*)$`, "i");
-    const m = block.match(re);
-    return m ? m[1].trim() : null;
-  }
+  // ---- 5) Parse contacts ----
+  const contacts = parseContactsFromContactInfo(contactBlock);
 
-  // Venue/event site block supports both "EVENT SITE" and older "EVENT/HOTEL SITE"
-  const eventSiteBlock =
-    sectionBetween(contactInfoBlock, "EVENT SITE", "CLIENT ONSITE CONTACT") ||
-    sectionBetween(contactInfoBlock, "EVENT\\/HOTEL SITE", "CLIENT ONSITE CONTACT");
+  // ---- 6) Schedule parsing ----
+  const scheduleBlock = (sectionMap["SCHEDULE OF EVENTS"]?.[0] || null);
+  const flights = scheduleBlock ? parseFlights(scheduleBlock) : [];
 
-  const clientOnsiteBlock =
-    sectionBetween(contactInfoBlock, "CLIENT ONSITE CONTACT", "LEADING AUTHORITIES\\s*CONTACTS") ||
-    sectionBetween(contactInfoBlock, "CLIENT ONSITE CONTACT", "LEADING AUTHORITIES CONTACTS");
+  // Optional: retain raw long sections
+  const eventDetails = (sectionMap["EVENT DETAILS"]?.[0] || null);
+  const clientDetails = (sectionMap["CLIENT DETAILS"]?.[0] || null);
+  const talentIntro = (sectionMap["TALENT INTRODUCTION"]?.[0] || null);
 
-  const laiContactsBlock =
-    sectionBetween(contactInfoBlock, "LEADING AUTHORITIES\\s*CONTACTS", "TALENT CONTACT") ||
-    sectionBetween(contactInfoBlock, "LEADING AUTHORITIES CONTACTS", "TALENT CONTACT");
-
-  // Talent contact sometimes ends with "**Day of, Urgent Use Only**"
-  const talentBlock =
-    sectionBetween(contactInfoBlock, "TALENT CONTACT", "\\*\\*Day of, Urgent Use Only\\*\\*") ||
-    sectionToEnd(contactInfoBlock, "TALENT CONTACT");
-
-  // Build venue
-  const venueName = eventSiteBlock ? match1(eventSiteBlock, /^(.+?)\n/) : null;
-
-  const venue = eventSiteBlock ? {
-    raw: eventSiteBlock,
-    name: venueName,
-    phone: match1(eventSiteBlock, /Phone:\s*(\(\d{3}\)\s*\d{3}-\d{4})/i),
-    address: (() => {
-      const lines = eventSiteBlock.split("\n").map(s => s.trim()).filter(Boolean);
-      // Usually: name, street, city/state/zip, Phone...
-      return lines.slice(0, 3).join(", ");
-    })()
-  } : null;
-
-  // Client onsite contact
-  const clientOnsite = clientOnsiteBlock ? {
-    raw: clientOnsiteBlock,
-    nameTitle: match1(clientOnsiteBlock, /^(.+?)(?:\nOffice:|\nCell:|\nEmail:|$)/i),
-    office: match1(clientOnsiteBlock, /Office:\s*(\(\d{3}\)\s*\d{3}-\d{4})/i),
-    cell: match1(clientOnsiteBlock, /Cell:\s*([0-9()\- ]{7,})/i),
-    email: match1(clientOnsiteBlock, /Email:\s*([^\s]+@[^\s]+)/i),
-  } : null;
-
-  // LAI contacts (may be multiple)
-  const laiContacts = [];
-  if (laiContactsBlock) {
-    const chunks = laiContactsBlock
-      .split(/\n(?=[A-Z][a-zA-Z]+.*?,\s)/)
-      .map(s => s.trim())
-      .filter(Boolean);
-
-    for (const c of chunks) {
-      laiContacts.push({
-        raw: c,
-        nameTitle: match1(c, /^(.+?)(?:\nOffice:|$)/i),
-        office: match1(c, /Office:\s*(\(\d{3}\)\s*\d{3}-\d{4})/i),
-        cell: match1(c, /Cell:\s*(\(\d{3}\)\s*\d{3}-\d{4})/i),
-      });
-    }
-  }
-
-  // Talent contact
-  const talentContact = talentBlock ? {
-    raw: talentBlock,
-    name: match1(talentBlock, /^(.+?)\n/i),
-    cell: match1(talentBlock, /Cell:\s*(\(\d{3}\)\s*\d{3}-\d{4})/i),
-  } : null;
-
-  // Emergency block (best-effort)
-  const emergencyBlock = matchBlock(t, /EMERGENCY TRAVEL\s*NUMBERS:\s*([\s\S]*?)(?:\n=== PAGE 2 ===|\nSCHEDULE OF EVENTS|$)/i);
-  const emergencyTravel = emergencyBlock ? {
-    raw: emergencyBlock,
-    phone: match1(emergencyBlock, /Phone:\s*(\(\d{3}\)\s*\d{3}-\d{4})/i),
-  } : null;
-
-  // Schedule section (best-effort)
-  const scheduleBlock = matchBlock(t, /SCHEDULE OF EVENTS\s*([\s\S]*?)\n- - -\nEVENT DETAILS/i);
-  const flights = [];
-  if (scheduleBlock) {
-    const re = /\b([A-Z]{2})\s+(\d{3,5})\b[\s\S]*?(?=\n\n|\b[A-Z]{2}\s+\d{3,5}\b|$)/g;
-    let m;
-    while ((m = re.exec(scheduleBlock))) {
-      const raw = normalize(m[0]);
-      flights.push({
-        airline: m[1],
-        flightNumber: m[2],
-        raw,
-        reservationCode: match1(raw, /Reservation Code:\s*([A-Z0-9]+)/i),
-        seat: match1(raw, /Seat\s*([A-Z0-9]+)/i)
-      });
-    }
-  }
-
-  const eventDetails = matchBlock(t, /EVENT DETAILS\s*([\s\S]*?)\n- - -/i) || null;
-  const clientDetails = matchBlock(t, /CLIENT DETAILS\s*([\s\S]*?)\n- - -/i) || null;
-  const talentIntro = matchBlock(t, /TALENT INTRODUCTION\s*([\s\S]*?)$/i) || null;
+  // ---- 7) Confidence ----
+  const confidence = computeConfidence({
+    bookingNumber,
+    talentName: header.talentName,
+    clientName: header.clientName,
+    eventTitle: header.eventTitle,
+    eventDateText: header.eventDateText,
+    sites,
+    contacts
+  });
 
   return {
     bookingNumber,
-    talentName,
-    clientName,
-    eventTitle,
-    eventDateText,
-    venue,
-    contacts: { clientOnsite, laiContacts, talentContact, emergencyTravel },
-    schedule: scheduleBlock ? { raw: scheduleBlock, flights } : null,
-    eventDetails,
-    clientDetails,
-    talentIntroduction: talentIntro
+    header,
+    sites,
+    contacts,
+    schedule: scheduleBlock ? { flights, raw: scheduleBlock } : null,
+    sections: {
+      contactInformation: contactBlock || null,
+      eventDetails,
+      clientDetails,
+      talentIntroduction: talentIntro
+    },
+    confidence
   };
 }
+
+/* ------------------------- SECTION SPLITTING ------------------------- */
+
+/**
+ * Multi-section splitter: returns arrays per heading so repeated headings don't break parsing.
+ * Example: map["EVENT DETAILS"] = ["...", "..."] if it appears twice.
+ */
+function splitByHeadingsMulti(text, headings) {
+  const hits = [];
+
+  for (const h of headings) {
+    const re = new RegExp(`\\b${escapeRe(h).replace(/\\s+/g, "\\\\s+")}\\b`, "ig");
+    let m;
+    while ((m = re.exec(text))) {
+      hits.push({ heading: h, idx: m.index, len: m[0].length });
+    }
+  }
+
+  hits.sort((a, b) => a.idx - b.idx);
+
+  const out = {};
+  for (let i = 0; i < hits.length; i++) {
+    const start = hits[i].idx + hits[i].len;
+    const end = i + 1 < hits.length ? hits[i + 1].idx : text.length;
+
+    const h = hits[i].heading;
+    const chunk = text.slice(start, end).trim();
+
+    if (!out[h]) out[h] = [];
+    out[h].push(chunk);
+  }
+
+  return out;
+}
+
+function escapeRe(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/* ------------------------- HEADER PARSING ------------------------- */
+
+function parseHeaderBlock(block) {
+  if (!block) {
+    return { talentName: null, clientName: null, eventTitle: null, eventDateText: null, raw: null };
+  }
+  const lines = block.split("\n").map(x => x.trim()).filter(Boolean);
+
+  const dateIdx = lines.findIndex(l =>
+    /\b(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b/i.test(l) ||
+    /\b(January|February|March|April|May|June|July|August|September|October|November|December)\b/i.test(l)
+  );
+  const eventDateText = dateIdx >= 0 ? lines[dateIdx] : null;
+
+  const talentName = lines[0] || null;
+
+  let clientName = null, eventTitle = null;
+  if (dateIdx >= 0) {
+    clientName = lines[1] || null;
+    eventTitle = lines[2] || null;
+  } else {
+    clientName = lines[1] || null;
+    eventTitle = lines[2] || null;
+  }
+
+  return { talentName, clientName, eventTitle, eventDateText, raw: block };
+}
+
+/* ------------------------- SITES PARSING ------------------------- */
+
+function parseSitesFromContactInfo(contactBlock) {
+  if (!contactBlock) return [];
+
+  const siteLabels = [
+    { type: "event", label: "EVENT SITE" },
+    { type: "event", label: "EVENT\\/HOTEL SITE" }, // sometimes combined
+    { type: "hotel", label: "HOTEL SITE" },
+    { type: "hotel", label: "HOTEL" } // occasional shorthand
+  ];
+
+  const labelPositions = [];
+  for (const s of siteLabels) {
+    const re = new RegExp(`\\b${s.label}\\b\\s*:\\s*`, "i");
+    const m = re.exec(contactBlock);
+    if (m) labelPositions.push({ ...s, idx: m.index, matchLen: m[0].length });
+  }
+  labelPositions.sort((a, b) => a.idx - b.idx);
+
+  const nextCapsLabelRe = /\n[A-Z][A-Z \/\*]{3,}:\s*/g;
+
+  const sites = [];
+  for (let i = 0; i < labelPositions.length; i++) {
+    const start = labelPositions[i].idx + labelPositions[i].matchLen;
+    const end = i + 1 < labelPositions.length ? labelPositions[i + 1].idx : contactBlock.length;
+    let chunk = contactBlock.slice(start, end).trim();
+
+    // cut at next caps label if present inside chunk
+    const m2 = nextCapsLabelRe.exec("\n" + chunk);
+    if (m2 && m2.index > 0) chunk = chunk.slice(0, m2.index).trim();
+
+    const parsed = parseAddressBlock(chunk);
+    const hotelDetails = (labelPositions[i].type === "hotel") ? parseHotelDetails(chunk) : null;
+
+    sites.push({
+      type: labelPositions[i].type,
+      label:
+        labelPositions[i].type === "event" ? "EVENT SITE" : "HOTEL SITE",
+      ...parsed,
+      ...(hotelDetails ? { hotelDetails } : {}),
+      raw: chunk
+    });
+  }
+
+  // If none found but contact block contains a clear venue address/phone, keep fallback as event site
+  if (!sites.length) {
+    const fallbackPhone = match1(contactBlock, /Phone:\s*([0-9()\- ]{7,})/i);
+    if (fallbackPhone) {
+      sites.push({
+        type: "event",
+        label: "EVENT SITE",
+        ...parseAddressBlock(contactBlock),
+        raw: contactBlock
+      });
+    }
+  }
+
+  return sites;
+}
+
+function parseAddressBlock(block) {
+  const lines = String(block || "").split("\n").map(s => s.trim()).filter(Boolean);
+
+  const name = lines[0] || null;
+  const phone = match1(block, /Phone:\s*([0-9()\- ]{7,})/i);
+  const email = match1(block, /Email:\s*([^\s]+@[^\s]+)/i);
+
+  const addrLines = lines
+    .filter(l => !/^Phone:/i.test(l) && !/^Email:/i.test(l))
+    .slice(0, 4); // allow 4 lines because some include suite/floor
+  const address = addrLines.length ? addrLines.join(", ") : null;
+
+  return { name, address, phone, email };
+}
+
+function parseHotelDetails(block) {
+  const checkIn = match1(block, /Check-?In:\s*([^\n]+)/i);
+  const checkOut = match1(block, /Check-?Out:\s*([^\n]+)/i);
+  const confirmation = match1(block, /Confirmation(?:\s*#|\s*Number)?:\s*([A-Z0-9\-]+)/i);
+  const roomType = match1(block, /Room Type:\s*([^\n]+)/i);
+  const nights = match1(block, /Nights:\s*(\d+)/i);
+  const rate = match1(block, /Rate:\s*([$€£]?\s*[0-9,]+(?:\.[0-9]{2})?)/i);
+
+  // only return if at least one is present
+  if (!(checkIn || checkOut || confirmation || roomType || nights || rate)) return null;
+
+  return {
+    checkIn: checkIn || null,
+    checkOut: checkOut || null,
+    confirmation: confirmation || null,
+    roomType: roomType || null,
+    nights: nights ? Number(nights) : null,
+    rate: rate || null
+  };
+}
+
+/* ------------------------- CONTACTS PARSING ------------------------- */
+
+function parseContactsFromContactInfo(contactBlock) {
+  if (!contactBlock) return [];
+
+  const labelDefs = [
+    { group: "client_onsite", labels: ["CLIENT ONSITE CONTACT", "CLIENT ONSITE CONTACTS"] },
+    { group: "lai_onsite", labels: ["LEADING AUTHORITIES ONSITE CONTACT", "LEADING AUTHORITIES ONSITE CONTACTS"] },
+    { group: "lai_contacts", labels: ["LEADING AUTHORITIES CONTACTS", "LEADING AUTHORITIES\\s*CONTACTS"] },
+    { group: "talent", labels: ["TALENT CONTACT"] }
+  ];
+
+  const chunks = sliceLabeledChunks(contactBlock, labelDefs);
+
+  const out = [];
+  for (const ch of chunks) {
+    if (ch.group === "talent") out.push(...parseTalentContacts(ch.text));
+    else out.push(...parsePeopleList(ch.text, ch.group));
+  }
+
+  return dedupeContacts(out);
+}
+
+function sliceLabeledChunks(block, labelDefs) {
+  const hits = [];
+
+  // find label occurrences (first match per label is usually enough; but we’ll take all)
+  for (const def of labelDefs) {
+    for (const rawLabel of def.labels) {
+      const re = new RegExp(`\\b${rawLabel}\\b\\s*:\\s*`, "ig");
+      let m;
+      while ((m = re.exec(block))) {
+        hits.push({ group: def.group, label: rawLabel, idx: m.index, len: m[0].length });
+      }
+    }
+  }
+
+  if (!hits.length) return [];
+
+  hits.sort((a, b) => a.idx - b.idx);
+
+  const chunks = [];
+  for (let i = 0; i < hits.length; i++) {
+    const start = hits[i].idx + hits[i].len;
+    const end = i + 1 < hits.length ? hits[i + 1].idx : block.length;
+    const text = block.slice(start, end).trim();
+    chunks.push({ group: hits[i].group, text });
+  }
+  return chunks;
+}
+
+function parsePeopleList(text, group) {
+  const lines = String(text || "").split("\n").map(s => s.trim()).filter(Boolean);
+  if (!lines.length) return [];
+
+  // person starts often look like "First Last, Title"
+  const blocks = [];
+  let cur = [];
+  for (const l of lines) {
+    const newPerson = /^[A-Z][a-zA-Z'’.\- ]+,\s+/.test(l);
+    if (newPerson && cur.length) {
+      blocks.push(cur.join("\n"));
+      cur = [l];
+    } else {
+      cur.push(l);
+    }
+  }
+  if (cur.length) blocks.push(cur.join("\n"));
+
+  // If we never detected a new person line, treat whole thing as one person block
+  if (!blocks.length) blocks.push(lines.join("\n"));
+
+  return blocks.map(b => parsePersonBlock(b, group)).filter(Boolean);
+}
+
+function parsePersonBlock(block, group) {
+  const nameTitleLine = (block.split("\n")[0] || "").trim();
+  if (!nameTitleLine) return null;
+
+  const name = nameTitleLine.includes(",")
+    ? nameTitleLine.split(",")[0].trim()
+    : nameTitleLine.trim();
+
+  const title = nameTitleLine.includes(",")
+    ? nameTitleLine.split(",").slice(1).join(",").trim()
+    : null;
+
+  return {
+    group,
+    name: name || null,
+    title: title || null,
+    office: match1(block, /Office:\s*([0-9()\- ]{7,})/i),
+    cell: match1(block, /Cell:\s*([0-9()\- ]{7,})/i) || match1(block, /Mobile:\s*([0-9()\- ]{7,})/i),
+    email: match1(block, /Email:\s*([^\s]+@[^\s]+)/i),
+    raw: block
+  };
+}
+
+function parseTalentContacts(text) {
+  const block = String(text || "").trim();
+  if (!block) return [];
+
+  // "Name (will be accompanied by X) Tom’s Cell: (...)"
+  const primaryName = match1(block, /^(.+?)(?:\n|\(|$)/i);
+  const companion = match1(block, /\(will be accompanied by ([^)]+)\)/i);
+
+  const talentCell = match1(block, /\bCell:\s*([0-9()\- ]{7,})/i) || null;
+
+  // Generic "<Name>'s Cell: (###) ###-####"
+  const companionCell = match1(block, /[A-Z][a-zA-Z]+[’']s Cell:\s*([0-9()\- ]{7,})/i) || null;
+
+  const out = [];
+  out.push({
+    group: "talent",
+    name: primaryName || null,
+    title: null,
+    cell: talentCell,
+    email: match1(block, /Email:\s*([^\s]+@[^\s]+)/i),
+    companion: companion || null,
+    raw: block
+  });
+
+  if (companion) {
+    out.push({
+      group: "talent_companion",
+      name: companion,
+      title: null,
+      cell: companionCell,
+      email: null,
+      raw: block
+    });
+  }
+
+  return out;
+}
+
+function dedupeContacts(list) {
+  const seen = new Set();
+  const out = [];
+  for (const c of list || []) {
+    const key = [
+      (c.group || "").toLowerCase(),
+      (c.name || "").toLowerCase(),
+      (c.email || "").toLowerCase(),
+      normalizePhone(c.cell || ""),
+      normalizePhone(c.office || "")
+    ].join("|");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(c);
+  }
+  return out;
+}
+
+function normalizePhone(s) {
+  return String(s || "").replace(/[^\d]+/g, "");
+}
+
+/* ------------------------- FLIGHTS ------------------------- */
+
+function parseFlights(scheduleBlock) {
+  const flights = [];
+
+  // This is intentionally broad because some briefs do “Delta 1234” and others “DL 1234”.
+  const re = /\b([A-Z]{2,}|[A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+)*)\s+#?(\d{2,5})\b[\s\S]*?(?=\n\n|\b([A-Z]{2,}|[A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+)*)\s+#?\d{2,5}\b|$)/g;
+
+  let m;
+  while ((m = re.exec(scheduleBlock))) {
+    const raw = normalize(m[0]);
+    flights.push({
+      airline: String(m[1] || "").trim(),
+      flightNumber: String(m[2] || "").trim(),
+      reservationCode:
+        match1(raw, /(?:Reservation Code|Airline Reservation Code):\s*([A-Z0-9]+)/i),
+      seat: match1(raw, /\bSeat:\s*([A-Z0-9]+)/i) || match1(raw, /\bSeat\s+([A-Z0-9]+)\b/i),
+      raw
+    });
+  }
+  return flights;
+}
+
+/* ------------------------- CONFIDENCE ------------------------- */
+
+function computeConfidence(x) {
+  const score = (v) => (v ? 1 : 0);
+
+  const headerScore =
+    score(x.bookingNumber) +
+    score(x.talentName) +
+    score(x.clientName) +
+    score(x.eventTitle) +
+    score(x.eventDateText);
+
+  const sitesScore = (x.sites || []).length ? 1 : 0;
+  const contactsScore = (x.contacts || []).length ? 1 : 0;
+
+  const total = headerScore + sitesScore + contactsScore;
+  const max = 7;
+
+  return {
+    overall: Math.round((total / max) * 100),
+    hasBookingNumber: !!x.bookingNumber,
+    hasHeader: !!(x.talentName || x.clientName || x.eventTitle || x.eventDateText),
+    hasSites: !!(x.sites || []).length,
+    hasContacts: !!(x.contacts || []).length
+  };
+}
+
+/* ------------------------- TEXT HELPERS ------------------------- */
 
 function normalize(s) {
   return String(s || "")
@@ -333,12 +623,12 @@ function normalize(s) {
 
 function match1(text, re) {
   const m = String(text || "").match(re);
-  return m ? (m[1] || m[0]).toString().trim() : null;
+  return m ? String(m[1] ?? m[0]).trim() : null;
 }
 
 function matchBlock(text, re) {
   const m = String(text || "").match(re);
-  return m ? (m[1] || "").toString().trim() : null;
+  return m ? String(m[1] || "").trim() : null;
 }
 
 function json(obj, status = 200) {
@@ -347,3 +637,4 @@ function json(obj, status = 200) {
     headers: { "content-type": "application/json; charset=utf-8" }
   });
 }
+
